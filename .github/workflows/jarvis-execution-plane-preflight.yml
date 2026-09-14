@@ -1,0 +1,187 @@
+name: JARVIS execution-plane preflight
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/jarvis-execution-plane-preflight.yml"
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Exact branch, tag, or commit SHA to validate without mutating it
+        required: true
+        type: string
+      patch_b64_gzip:
+        description: Optional gzip+base64 unified diff applied only inside the runner workspace
+        required: false
+        default: ""
+        type: string
+      profile:
+        description: Deterministic validation profile
+        required: true
+        default: frontend
+        type: choice
+        options:
+          - smoke
+          - frontend
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jarvis-execution-plane-${{ github.event.pull_request.number || inputs.target_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Preflight (${{ inputs.profile || 'smoke' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      TARGET_REF: ${{ inputs.target_ref || github.sha }}
+      PATCH_B64_GZIP: ${{ inputs.patch_b64_gzip || '' }}
+      PROFILE: ${{ inputs.profile || 'smoke' }}
+    steps:
+      - name: Checkout pull request smoke target
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          path: target
+
+      - name: Checkout exact dispatched target
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+          path: target
+
+      - name: Freeze exact target head
+        id: head
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git -C target rev-parse HEAD)"
+          echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "TARGET_HEAD=$head_sha"
+
+      - name: Decode and apply staged patch in workspace only
+        if: github.event_name == 'workflow_dispatch' && inputs.patch_b64_gzip != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch_file="$RUNNER_TEMP/jarvis-delta.patch"
+          printf '%s' "$PATCH_B64_GZIP" | base64 --decode | gzip -dc > "$patch_file"
+          test -s "$patch_file"
+          git -C target apply --check "$patch_file"
+          git -C target apply "$patch_file"
+          git -C target diff --check
+
+      - name: Audit JARVIS repository execution contract
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s target/AGENTS.md
+          grep -F "Validate before push" target/AGENTS.md
+          grep -F "Git publication is atomic" target/AGENTS.md
+
+      - name: Smoke profile
+        if: env.PROFILE == 'smoke'
+        shell: bash
+        working-directory: target
+        run: |
+          set -euo pipefail
+          git status --short
+          git diff --check
+
+      - name: Set up Node.js
+        if: env.PROFILE == 'frontend'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24.19.0"
+          package-manager-cache: false
+
+      - name: Activate pnpm
+        if: env.PROFILE == 'frontend'
+        shell: bash
+        working-directory: target
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.24.0 --activate
+          test "$(pnpm --version)" = "11.24.0"
+
+      - name: Install canonical dependencies
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm install --frozen-lockfile
+
+      - name: Matrix unit test first
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm --filter @jarvis-sofia/command-center test --run src/app/sofiaWebCapabilityMatrix.test.ts
+
+      - name: Install Chromium before focal browser gates
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm --filter @jarvis-sofia/command-center exec playwright install --with-deps chromium
+
+      - name: Repository evolution focal browser test
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm --filter @jarvis-sofia/command-center exec playwright test browser-tests/repository-evolution.spec.ts
+
+      - name: Hybrid brain routing focal browser test
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm --filter @jarvis-sofia/command-center exec playwright test browser-tests/hybrid-brain-routing.spec.ts
+
+      - name: Full frontend unit suite
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm frontend:test
+
+      - name: Frontend typecheck
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm frontend:typecheck
+
+      - name: Frontend build
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        env:
+          VITE_JARVIS_API_BASE_URL: https://jarvis-sofia-core.onrender.com
+        run: pnpm frontend:build
+
+      - name: Full browser suite
+        if: env.PROFILE == 'frontend'
+        working-directory: target
+        run: pnpm --filter @jarvis-sofia/command-center browser:test
+
+      - name: Record deterministic preflight evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "target_ref=$TARGET_REF"
+            echo "target_head=${{ steps.head.outputs.sha }}"
+            echo "profile=$PROFILE"
+            echo "patch_present=$([[ -n "$PATCH_B64_GZIP" ]] && echo true || echo false)"
+            echo "workflow_run=$GITHUB_RUN_ID"
+          } > evidence/preflight.env
+          git -C target status --short > evidence/status.txt || true
+          git -C target diff --binary > evidence/validated.patch || true
+
+      - name: Upload preflight evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: jarvis-execution-plane-preflight-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 3
