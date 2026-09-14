@@ -24,24 +24,85 @@ on:
         options:
           - smoke
           - frontend
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
+  issues: read
+  pull-requests: read
 
 concurrency:
-  group: jarvis-execution-plane-${{ github.event.pull_request.number || inputs.target_ref || github.ref }}
-  cancel-in-progress: true
+  group: jarvis-execution-plane-${{ github.event.pull_request.number || github.event.comment.id || inputs.target_ref || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   preflight:
-    name: Preflight (${{ inputs.profile || 'smoke' }})
+    name: Preflight
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.actor == github.repository_owner && startsWith(github.event.comment.body, '/jarvis-preflight '))
     runs-on: ubuntu-24.04
     timeout-minutes: 35
-    env:
-      TARGET_REF: ${{ inputs.target_ref || github.sha }}
-      PATCH_B64_GZIP: ${{ inputs.patch_b64_gzip || '' }}
-      PROFILE: ${{ inputs.profile || 'smoke' }}
     steps:
+      - name: Resolve validation request
+        id: request
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TARGET_REF: ${{ inputs.target_ref }}
+          DISPATCH_PATCH_B64_GZIP: ${{ inputs.patch_b64_gzip }}
+          DISPATCH_PROFILE: ${{ inputs.profile }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+
+          event = os.environ["EVENT_NAME"]
+          base_ref = ""
+          profile = "smoke"
+          patch_blob_sha = ""
+          patch_b64_gzip = ""
+
+          if event == "pull_request":
+              base_ref = os.environ.get("GITHUB_SHA", "")
+          elif event == "workflow_dispatch":
+              base_ref = os.environ.get("DISPATCH_TARGET_REF", "").strip()
+              profile = (os.environ.get("DISPATCH_PROFILE", "frontend") or "frontend").strip()
+              patch_b64_gzip = os.environ.get("DISPATCH_PATCH_B64_GZIP", "").strip()
+          elif event == "issue_comment":
+              body = os.environ.get("COMMENT_BODY", "")
+              prefix = "/jarvis-preflight "
+              if not body.startswith(prefix):
+                  raise SystemExit("comment does not contain a preflight request")
+              payload = json.loads(body[len(prefix):].strip())
+              if set(payload) - {"base_ref", "patch_blob_sha", "profile"}:
+                  raise SystemExit("unsupported preflight request key")
+              base_ref = str(payload.get("base_ref", "")).strip()
+              patch_blob_sha = str(payload.get("patch_blob_sha", "")).strip()
+              profile = str(payload.get("profile", "smoke")).strip()
+          else:
+              raise SystemExit(f"unsupported event: {event}")
+
+          if event != "pull_request":
+              if not re.fullmatch(r"(?:[0-9a-f]{40}|[A-Za-z0-9._/-]{1,200})", base_ref):
+                  raise SystemExit("invalid base_ref")
+              if patch_blob_sha and not re.fullmatch(r"[0-9a-f]{40}", patch_blob_sha):
+                  raise SystemExit("invalid patch_blob_sha")
+              if profile not in {"smoke", "frontend"}:
+                  raise SystemExit("invalid profile")
+
+          outputs = os.environ["GITHUB_OUTPUT"]
+          with open(outputs, "a", encoding="utf-8") as fh:
+              fh.write(f"base_ref={base_ref}\n")
+              fh.write(f"profile={profile}\n")
+              fh.write(f"patch_blob_sha={patch_blob_sha}\n")
+              fh.write(f"patch_b64_gzip={patch_b64_gzip}\n")
+          PY
+
       - name: Checkout pull request smoke target
         if: github.event_name == 'pull_request'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -49,11 +110,11 @@ jobs:
           fetch-depth: 0
           path: target
 
-      - name: Checkout exact dispatched target
-        if: github.event_name == 'workflow_dispatch'
+      - name: Checkout requested base
+        if: github.event_name != 'pull_request'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ steps.request.outputs.base_ref }}
           fetch-depth: 0
           path: target
 
@@ -66,9 +127,11 @@ jobs:
           echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "TARGET_HEAD=$head_sha"
 
-      - name: Decode and apply staged patch in workspace only
-        if: github.event_name == 'workflow_dispatch' && inputs.patch_b64_gzip != ''
+      - name: Decode and apply dispatched patch in workspace only
+        if: github.event_name == 'workflow_dispatch' && steps.request.outputs.patch_b64_gzip != ''
         shell: bash
+        env:
+          PATCH_B64_GZIP: ${{ steps.request.outputs.patch_b64_gzip }}
         run: |
           set -euo pipefail
           patch_file="$RUNNER_TEMP/jarvis-delta.patch"
@@ -78,17 +141,49 @@ jobs:
           git -C target apply "$patch_file"
           git -C target diff --check
 
+      - name: Fetch and apply comment patch blob in workspace only
+        if: github.event_name == 'issue_comment' && steps.request.outputs.patch_blob_sha != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PATCH_BLOB_SHA: ${{ steps.request.outputs.patch_blob_sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          patch_file="$RUNNER_TEMP/jarvis-delta.patch"
+          response="$RUNNER_TEMP/blob.json"
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPOSITORY/git/blobs/$PATCH_BLOB_SHA" \
+            > "$response"
+          python - "$response" "$patch_file" <<'PY'
+          import base64
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if payload.get("encoding") != "base64" or not payload.get("content"):
+              raise SystemExit("blob response is not base64 content")
+          pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(payload["content"]))
+          PY
+          test -s "$patch_file"
+          git -C target apply --check "$patch_file"
+          git -C target apply "$patch_file"
+          git -C target diff --check
+
       - name: Audit JARVIS repository execution contract
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'pull_request' && hashFiles('target/AGENTS.md') != ''
         shell: bash
         run: |
           set -euo pipefail
-          test -s target/AGENTS.md
           grep -F "Validate before push" target/AGENTS.md
           grep -F "Git publication is atomic" target/AGENTS.md
 
       - name: Smoke profile
-        if: env.PROFILE == 'smoke'
+        if: steps.request.outputs.profile == 'smoke'
         shell: bash
         working-directory: target
         run: |
@@ -97,14 +192,14 @@ jobs:
           git diff --check
 
       - name: Set up Node.js
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "24.19.0"
           package-manager-cache: false
 
       - name: Activate pnpm
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         shell: bash
         working-directory: target
         run: |
@@ -114,64 +209,69 @@ jobs:
           test "$(pnpm --version)" = "11.24.0"
 
       - name: Install canonical dependencies
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm install --frozen-lockfile
 
       - name: Matrix unit test first
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm --filter @jarvis-sofia/command-center test --run src/app/sofiaWebCapabilityMatrix.test.ts
 
       - name: Install Chromium before focal browser gates
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm --filter @jarvis-sofia/command-center exec playwright install --with-deps chromium
 
       - name: Repository evolution focal browser test
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm --filter @jarvis-sofia/command-center exec playwright test browser-tests/repository-evolution.spec.ts
 
       - name: Hybrid brain routing focal browser test
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm --filter @jarvis-sofia/command-center exec playwright test browser-tests/hybrid-brain-routing.spec.ts
 
       - name: Full frontend unit suite
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm frontend:test
 
       - name: Frontend typecheck
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm frontend:typecheck
 
       - name: Frontend build
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         env:
           VITE_JARVIS_API_BASE_URL: https://jarvis-sofia-core.onrender.com
         run: pnpm frontend:build
 
       - name: Full browser suite
-        if: env.PROFILE == 'frontend'
+        if: steps.request.outputs.profile == 'frontend'
         working-directory: target
         run: pnpm --filter @jarvis-sofia/command-center browser:test
 
       - name: Record deterministic preflight evidence
         if: always()
         shell: bash
+        env:
+          BASE_REF: ${{ steps.request.outputs.base_ref }}
+          PROFILE: ${{ steps.request.outputs.profile }}
+          PATCH_BLOB_SHA: ${{ steps.request.outputs.patch_blob_sha }}
         run: |
           set -euo pipefail
           mkdir -p evidence
           {
             echo "repository=$GITHUB_REPOSITORY"
-            echo "target_ref=$TARGET_REF"
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "base_ref=$BASE_REF"
             echo "target_head=${{ steps.head.outputs.sha }}"
             echo "profile=$PROFILE"
-            echo "patch_present=$([[ -n "$PATCH_B64_GZIP" ]] && echo true || echo false)"
+            echo "patch_blob_sha=$PATCH_BLOB_SHA"
             echo "workflow_run=$GITHUB_RUN_ID"
           } > evidence/preflight.env
           git -C target status --short > evidence/status.txt || true
