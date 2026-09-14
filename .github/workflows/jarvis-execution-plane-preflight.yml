@@ -7,27 +7,17 @@ on:
       - ".github/workflows/jarvis-execution-plane-preflight.yml"
   workflow_dispatch:
     inputs:
-      target_repo:
-        description: Repository to validate
-        required: true
-        default: adriano86744-dotcom/jarvis-quant-engine
-        type: string
       target_ref:
-        description: Exact branch, tag, or commit SHA to validate
+        description: Exact branch, tag, or commit SHA to validate without mutating it
         required: true
         type: string
-      control_ref:
-        description: Ref in this runner repository containing an optional staged patch
-        required: true
-        default: main
-        type: string
-      patch_path:
-        description: Optional patch path under staging/ in this runner repository
+      patch_b64_gzip:
+        description: Optional gzip+base64 unified diff applied only inside the runner workspace
         required: false
         default: ""
         type: string
       profile:
-        description: Validation profile
+        description: Deterministic validation profile
         required: true
         default: frontend
         type: choice
@@ -48,9 +38,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
-      TARGET_REPO: ${{ inputs.target_repo || 'adriano86744-dotcom/jarvis-quant-engine' }}
-      TARGET_REF: ${{ inputs.target_ref || 'main' }}
-      PATCH_PATH: ${{ inputs.patch_path || '' }}
+      TARGET_REF: ${{ inputs.target_ref || github.sha }}
+      PATCH_B64_GZIP: ${{ inputs.patch_b64_gzip || '' }}
       PROFILE: ${{ inputs.profile || 'smoke' }}
     steps:
       - name: Harden runner
@@ -58,43 +47,18 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Checkout control repository for pull request validation
+      - name: Checkout pull request smoke target
         if: github.event_name == 'pull_request'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          path: control
+          fetch-depth: 0
+          path: target
 
-      - name: Checkout control repository for dispatched validation
+      - name: Checkout exact dispatched target
         if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          ref: ${{ inputs.control_ref }}
-          path: control
-
-      - name: Validate dispatch inputs
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$TARGET_REPO"
-          test -n "$TARGET_REF"
-          case "$TARGET_REPO" in
-            adriano86744-dotcom/jarvis-quant-engine) ;;
-            *) echo "unsupported target_repo: $TARGET_REPO" >&2; exit 2 ;;
-          esac
-          if [ -n "$PATCH_PATH" ]; then
-            case "$PATCH_PATH" in
-              staging/*) ;;
-              *) echo "patch_path must stay under staging/: $PATCH_PATH" >&2; exit 2 ;;
-            esac
-            test -f "$GITHUB_WORKSPACE/control/$PATCH_PATH"
-          fi
-
-      - name: Checkout JARVIS target
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          repository: ${{ env.TARGET_REPO }}
-          ref: ${{ env.TARGET_REF }}
+          ref: ${{ inputs.target_ref }}
           fetch-depth: 0
           path: target
 
@@ -107,17 +71,20 @@ jobs:
           echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "TARGET_HEAD=$head_sha"
 
-      - name: Apply staged patch in workspace only
-        if: github.event_name == 'workflow_dispatch' && inputs.patch_path != ''
+      - name: Decode and apply staged patch in workspace only
+        if: github.event_name == 'workflow_dispatch' && inputs.patch_b64_gzip != ''
         shell: bash
         run: |
           set -euo pipefail
-          patch="$GITHUB_WORKSPACE/control/$PATCH_PATH"
-          git -C target apply --check "$patch"
-          git -C target apply "$patch"
+          patch_file="$RUNNER_TEMP/jarvis-delta.patch"
+          printf '%s' "$PATCH_B64_GZIP" | base64 --decode | gzip -dc > "$patch_file"
+          test -s "$patch_file"
+          git -C target apply --check "$patch_file"
+          git -C target apply "$patch_file"
           git -C target diff --check
 
-      - name: Audit repository execution contract
+      - name: Audit JARVIS repository execution contract
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
@@ -205,11 +172,11 @@ jobs:
           set -euo pipefail
           mkdir -p evidence
           {
-            echo "target_repo=$TARGET_REPO"
+            echo "repository=$GITHUB_REPOSITORY"
             echo "target_ref=$TARGET_REF"
             echo "target_head=${{ steps.head.outputs.sha }}"
             echo "profile=$PROFILE"
-            echo "patch_path=$PATCH_PATH"
+            echo "patch_present=$([[ -n "$PATCH_B64_GZIP" ]] && echo true || echo false)"
             echo "workflow_run=$GITHUB_RUN_ID"
           } > evidence/preflight.env
           git -C target status --short > evidence/status.txt || true
